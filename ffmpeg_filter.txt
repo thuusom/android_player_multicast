@@ -1,0 +1,1 @@
+[0:v]drawtext=fontsize=48:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=8:x=30:y=30:text='%{localtime}':font=monospace,drawtext=fontsize=28:fontcolor=yellow:x=30:y=90:text='LIVE MPEGTS TEST':font=monospace,drawtext=fontsize=24:fontcolor=cyan:x=30:y=(h-50):text='Frame %{n}  PTS %{pts\:hms}':font=monospace[vout]
