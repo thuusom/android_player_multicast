@@ -1,18 +1,16 @@
 # Android TV Multicast MPEGTS Player - Makefile
 #
 # Cross-platform: macOS (Intel/Apple Silicon) and Linux (x86_64/arm64)
+# Targets: Android TV emulator OR real Google TV / STB hardware
 #
-# Usage:
+# Emulator usage:
 #   make setup      - Install prerequisites (JDK 17, SDK components, AVD)
-#   make build      - Build the debug APK
-#   make emulator   - Launch Android TV emulator
-#   make install    - Install APK on emulator
-#   make stream     - Start ffmpeg test stream with UDP redirect
-#   make run        - Full pipeline: build, install, launch app, stream
-#   make stop       - Stop emulator and ffmpeg
-#   make clean      - Clean build artifacts
-#   make logs       - Tail logcat for player events
-#   make info       - Show detected platform and paths
+#   make run        - Full pipeline: emulator, build, install, stream
+#
+# STB usage (pass STB_IP=<ip>):
+#   make stb-setup  STB_IP=192.168.1.100   - Interactive STB setup
+#   make stb-run    STB_IP=192.168.1.100   - Full pipeline to STB
+#   make stb-stream STB_IP=192.168.1.100   - Stream to STB
 
 SHELL := /bin/bash
 
@@ -80,6 +78,12 @@ EMULATOR_SERIAL  := emulator-5554
 UDP_PORT         := 5000
 SYSTEM_IMAGE     := system-images;android-34;android-tv;$(EMU_ABI)
 
+# STB configuration (pass on command line: make stb-run STB_IP=192.168.1.100)
+STB_IP           ?=
+STB_ADB_PORT     ?= 5555
+STB_TARGET       = $(STB_IP):$(STB_ADB_PORT)
+MULTICAST_GROUP  ?=
+
 # Stream configuration
 STREAM_RESOLUTION := 1280x720
 STREAM_FRAMERATE := 25
@@ -96,11 +100,16 @@ GRADLEW          := ./gradlew
 export JAVA_HOME
 export ANDROID_HOME
 
-.PHONY: setup build emulator install launch stream run stop clean logs help check-env info
+.PHONY: setup build emulator install stream run stop clean logs help check-env info \
+        stb-setup stb-connect stb-disconnect stb-info stb-install stb-stream stb-run stb-stop stb-logs stb-screenshot
+
+# =====================================================================
+# Help & Info
+# =====================================================================
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
+		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 info: ## Show detected platform, architecture, and tool paths
 	@echo "Platform:       $(PLATFORM)"
@@ -110,7 +119,6 @@ info: ## Show detected platform, architecture, and tool paths
 	@echo "GPU mode:       $(GPU_MODE)"
 	@echo "JAVA_HOME:      $(JAVA_HOME)"
 	@echo "ANDROID_HOME:   $(ANDROID_HOME)"
-	@echo "SDK Manager:    $(SDKMANAGER)"
 	@echo "ADB:            $(ADB)"
 	@echo "Emulator:       $(EMULATOR)"
 	@echo "ffmpeg:         $$(command -v ffmpeg 2>/dev/null || echo '<not found>')"
@@ -119,9 +127,12 @@ check-env: ## Verify prerequisites are installed
 	@echo "Checking prerequisites ($(PLATFORM)/$(UNAME_M))..."
 	@test -x "$(JAVA_HOME)/bin/java" || { echo "ERROR: JDK 17 not found at $(JAVA_HOME). Run 'make setup'"; exit 1; }
 	@test -x "$(ADB)" || { echo "ERROR: Android SDK not found at $(ANDROID_HOME). Run 'make setup'"; exit 1; }
-	@test -x "$(EMULATOR)" || { echo "ERROR: Android emulator not found. Run 'make setup'"; exit 1; }
 	@command -v ffmpeg >/dev/null 2>&1 || { echo "ERROR: ffmpeg not found. Run 'make setup'"; exit 1; }
 	@echo "All prerequisites OK."
+
+# =====================================================================
+# Setup
+# =====================================================================
 
 setup: ## Install JDK 17, Android SDK components, and create TV AVD
 	@echo "==> Platform: $(PLATFORM) ($(UNAME_M)), ABI: $(EMU_ABI)"
@@ -196,10 +207,10 @@ endif
 	echo "sdk.dir=$(ANDROID_HOME)" > local.properties
 	@echo ""
 	@echo "Setup complete!"
-	@echo "  Platform:     $(PLATFORM) ($(UNAME_M))"
-	@echo "  JAVA_HOME:    $(JAVA_HOME)"
-	@echo "  ANDROID_HOME: $(ANDROID_HOME)"
-	@echo "  System image: $(SYSTEM_IMAGE)"
+
+# =====================================================================
+# Emulator targets
+# =====================================================================
 
 build: check-env ## Build the debug APK
 	@echo "==> Building APK..."
@@ -221,7 +232,7 @@ emulator: check-env ## Launch Android TV emulator in background
 	fi
 
 install: build ## Install APK and launch app on emulator
-	@echo "==> Installing APK..."
+	@echo "==> Installing APK on emulator..."
 	$(ADB) -s $(EMULATOR_SERIAL) install -r $(APK)
 	@echo "==> Launching app..."
 	$(ADB) -s $(EMULATOR_SERIAL) shell am start -n $(PACKAGE)/$(ACTIVITY)
@@ -234,14 +245,9 @@ redirect: ## Set up UDP port redirect on emulator
 		| nc localhost 5554 >/dev/null 2>&1 || true
 	@echo "UDP redirect active."
 
-stream: redirect ## Start ffmpeg MPEGTS test stream (with UDP redirect)
+stream: redirect ## Start ffmpeg MPEGTS test stream to emulator
 	@echo "==> Starting ffmpeg test stream on udp://127.0.0.1:$(UDP_PORT)..."
-	@echo "    Video: $(STREAM_RESOLUTION)@$(STREAM_FRAMERATE)fps H.264 $(STREAM_BITRATE)"
-	@echo "    Audio: AAC 48kHz stereo 128kbps + sine tone"
-	@echo "    Overlay: live clock, frame counter, PTS"
-	@echo "    Press Ctrl+C to stop the stream."
-	@echo ""
-	@# Generate filter script with correct resolution
+	@echo "    Press Ctrl+C to stop."
 	@sed "s/1280x720/$(STREAM_RESOLUTION)/g" ffmpeg_filter.txt > /tmp/multicast_filter.txt
 	ffmpeg -re \
 		-f lavfi -i "testsrc2=size=$(STREAM_RESOLUTION):rate=$(STREAM_FRAMERATE)" \
@@ -257,22 +263,108 @@ stream: redirect ## Start ffmpeg MPEGTS test stream (with UDP redirect)
 		-muxrate 4M \
 		-f mpegts "udp://127.0.0.1:$(UDP_PORT)?pkt_size=1316&buffer_size=65536"
 
-run: emulator install stream ## Full pipeline: emulator, build, install, stream
+run: emulator install stream ## Full emulator pipeline: boot, build, install, stream
 
-stop: ## Stop emulator and any ffmpeg test streams
+stop: ## Stop emulator and ffmpeg
 	@echo "==> Stopping ffmpeg..."
-	-pkill -f "ffmpeg.*udp://127.0.0.1:$(UDP_PORT)" 2>/dev/null || true
+	-pkill -f "ffmpeg.*udp://" 2>/dev/null || true
 	@echo "==> Stopping emulator..."
 	-$(ADB) -s $(EMULATOR_SERIAL) emu kill 2>/dev/null || true
 	@echo "Stopped."
 
-logs: ## Tail logcat for player events
+logs: ## Tail logcat for player events (emulator)
 	$(ADB) -s $(EMULATOR_SERIAL) logcat -s MulticastPlayer ExoPlayerImpl
+
+screenshot: ## Take a screenshot of the emulator
+	@$(ADB) -s $(EMULATOR_SERIAL) exec-out screencap -p > screenshot.png
+	@echo "Screenshot saved to screenshot.png"
 
 clean: ## Clean build artifacts
 	$(GRADLEW) clean
 	@echo "Clean complete."
 
-screenshot: ## Take a screenshot of the emulator
-	@$(ADB) -s $(EMULATOR_SERIAL) exec-out screencap -p > screenshot.png
-	@echo "Screenshot saved to screenshot.png"
+# =====================================================================
+# STB targets (pass STB_IP=<ip> on the command line)
+# =====================================================================
+
+stb-check-ip:
+	@if [ -z "$(STB_IP)" ]; then \
+		echo "ERROR: STB_IP is required. Usage: make <target> STB_IP=192.168.1.100"; \
+		exit 1; \
+	fi
+
+stb-setup: stb-check-ip check-env ## Interactive STB setup: enable ADB, connect, verify
+	./run.sh stb-setup -t $(STB_IP) -p $(STB_ADB_PORT)
+
+stb-connect: stb-check-ip check-env ## Connect ADB to STB
+	@echo "==> Connecting to STB at $(STB_TARGET)..."
+	$(ADB) connect $(STB_TARGET)
+	@sleep 1
+	@$(ADB) -s $(STB_TARGET) shell echo "connected" 2>/dev/null && \
+		echo "Connected to $$($(ADB) -s $(STB_TARGET) shell getprop ro.product.model 2>/dev/null | tr -d '\r')" || \
+		echo "Connection pending — check TV for authorization dialog."
+
+stb-disconnect: stb-check-ip ## Disconnect ADB from STB
+	$(ADB) disconnect $(STB_TARGET)
+
+stb-info: stb-check-ip check-env ## Show STB device information
+	./run.sh stb-info -t $(STB_IP) -p $(STB_ADB_PORT)
+
+stb-install: stb-check-ip build ## Build APK and install on STB
+	@echo "==> Connecting to STB at $(STB_TARGET)..."
+	@$(ADB) connect $(STB_TARGET) >/dev/null 2>&1 || true
+	@sleep 1
+	@echo "==> Installing APK on STB..."
+	$(ADB) -s $(STB_TARGET) install -r $(APK)
+	@echo "==> Launching app..."
+	@if [ -n "$(MULTICAST_GROUP)" ]; then \
+		$(ADB) -s $(STB_TARGET) shell am start -n $(PACKAGE)/$(ACTIVITY) \
+			--es STREAM_URI "udp://$(MULTICAST_GROUP):$(UDP_PORT)"; \
+	else \
+		$(ADB) -s $(STB_TARGET) shell am start -n $(PACKAGE)/$(ACTIVITY); \
+	fi
+	@echo "App launched on STB."
+
+stb-stream: stb-check-ip ## Stream test pattern to STB (unicast or multicast)
+	@echo "==> Streaming to STB at $(STB_IP):$(UDP_PORT)..."
+	@echo "    Press Ctrl+C to stop."
+	@sed "s/1280x720/$(STREAM_RESOLUTION)/g" ffmpeg_filter.txt > /tmp/multicast_filter.txt
+	@if [ -n "$(MULTICAST_GROUP)" ]; then \
+		echo "    Mode: multicast $(MULTICAST_GROUP):$(UDP_PORT)"; \
+		UDP_DEST="udp://$(MULTICAST_GROUP):$(UDP_PORT)?pkt_size=1316&ttl=2"; \
+	else \
+		echo "    Mode: unicast $(STB_IP):$(UDP_PORT)"; \
+		UDP_DEST="udp://$(STB_IP):$(UDP_PORT)?pkt_size=1316"; \
+	fi; \
+	ffmpeg -re \
+		-f lavfi -i "testsrc2=size=$(STREAM_RESOLUTION):rate=$(STREAM_FRAMERATE)" \
+		-f lavfi -i "sine=frequency=440:sample_rate=48000" \
+		-filter_complex_script /tmp/multicast_filter.txt \
+		-map "[vout]" -map 1:a \
+		-c:v libx264 -preset ultrafast -tune zerolatency \
+		-profile:v high -level 4.1 \
+		-b:v $(STREAM_BITRATE) -maxrate $(STREAM_BITRATE) -bufsize 1M \
+		-g $(STREAM_GOP) -keyint_min $(STREAM_GOP) \
+		-flags +cgop \
+		-c:a aac -b:a 128k -ac 2 \
+		-mpegts_flags +resend_headers \
+		-muxrate 4M \
+		-f mpegts "$$UDP_DEST"
+
+stb-run: stb-connect stb-install stb-stream ## Full STB pipeline: connect, build, install, stream
+
+stb-stop: stb-check-ip ## Stop streaming and app on STB
+	@echo "==> Stopping ffmpeg..."
+	-pkill -f "ffmpeg.*udp://" 2>/dev/null || true
+	@echo "==> Stopping app on STB..."
+	-$(ADB) -s $(STB_TARGET) shell am force-stop $(PACKAGE) 2>/dev/null || true
+	@echo "Stopped."
+
+stb-logs: stb-check-ip ## Tail logcat from STB
+	@$(ADB) connect $(STB_TARGET) >/dev/null 2>&1 || true
+	$(ADB) -s $(STB_TARGET) logcat -s MulticastPlayer ExoPlayerImpl
+
+stb-screenshot: stb-check-ip ## Capture screenshot from STB
+	@$(ADB) connect $(STB_TARGET) >/dev/null 2>&1 || true
+	@$(ADB) -s $(STB_TARGET) exec-out screencap -p > screenshot_stb.png
+	@echo "Screenshot saved to screenshot_stb.png"

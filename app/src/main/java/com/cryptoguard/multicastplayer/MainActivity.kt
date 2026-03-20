@@ -1,6 +1,8 @@
 package com.cryptoguard.multicastplayer
 
+import android.content.Context
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -19,9 +21,11 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
+import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MediaLoadData
 import androidx.media3.ui.PlayerView
 
@@ -49,6 +53,7 @@ class MainActivity : FragmentActivity() {
     private var lastDroppedFrames = 0L
     private var lastRenderedFrames = 0L
     private var statusBarVisible = false
+    private var multicastLock: WifiManager.MulticastLock? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -69,6 +74,7 @@ class MainActivity : FragmentActivity() {
 
     override fun onStart() {
         super.onStart()
+        acquireMulticastLock()
         initPlayer()
     }
 
@@ -76,6 +82,42 @@ class MainActivity : FragmentActivity() {
         super.onStop()
         handler.removeCallbacksAndMessages(null)
         releasePlayer()
+        releaseMulticastLock()
+    }
+
+    /**
+     * Android filters out multicast packets on WiFi by default to save battery.
+     * We must hold a MulticastLock to receive IGMP multicast traffic.
+     */
+    private fun acquireMulticastLock() {
+        try {
+            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            if (wifiManager != null) {
+                multicastLock = wifiManager.createMulticastLock("MulticastPlayer").apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+                Log.i(TAG, "✓ WiFi MulticastLock acquired")
+            } else {
+                Log.w(TAG, "WifiManager not available — multicast lock not acquired")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to acquire MulticastLock", e)
+        }
+    }
+
+    private fun releaseMulticastLock() {
+        try {
+            multicastLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                    Log.i(TAG, "WiFi MulticastLock released")
+                }
+            }
+            multicastLock = null
+        } catch (e: Exception) {
+            Log.e(TAG, "Error releasing MulticastLock", e)
+        }
     }
 
     private fun initPlayer() {
@@ -101,8 +143,17 @@ class MainActivity : FragmentActivity() {
         lastDroppedFrames = 0
         lastRenderedFrames = 0
 
+        // Use our custom MulticastUdpDataSource for UDP URIs (handles IGMP join)
+        val dataSourceFactory = MulticastUdpDataSource.Factory(
+            delegateFactory = DefaultDataSource.Factory(this)
+        )
+        val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
+
+        Log.i(TAG, "Using MulticastUdpDataSource (IGMP multicast support)")
+
         player = ExoPlayer.Builder(this)
             .setLoadControl(loadControl)
+            .setMediaSourceFactory(mediaSourceFactory)
             .build().also { exoPlayer ->
                 playerView?.player = exoPlayer
 

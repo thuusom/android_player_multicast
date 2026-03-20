@@ -189,7 +189,7 @@ MulticastPlayer: [STATS] Playing | res=1280x720 fps=-1.0 vBitrate=n/a | audio=au
 
 ## Available Commands
 
-### Makefile
+### Makefile — Emulator targets
 
 | Command           | Description                                       |
 |-------------------|---------------------------------------------------|
@@ -208,7 +208,22 @@ MulticastPlayer: [STATS] Playing | res=1280x720 fps=-1.0 vBitrate=n/a | audio=au
 | `make clean`      | Clean build artifacts                              |
 | `make check-env`  | Verify all prerequisites are installed             |
 
-### Bash script (`./run.sh`)
+### Makefile — STB targets (pass `STB_IP=<ip>`)
+
+| Command | Description |
+|---------|-------------|
+| `make stb-setup STB_IP=...` | Interactive first-time STB setup |
+| `make stb-connect STB_IP=...` | Connect ADB to STB |
+| `make stb-disconnect STB_IP=...` | Disconnect ADB from STB |
+| `make stb-info STB_IP=...` | Show STB device information |
+| `make stb-install STB_IP=...` | Build and install APK on STB |
+| `make stb-stream STB_IP=...` | Stream test pattern to STB |
+| `make stb-run STB_IP=...` | Full pipeline: connect + install + stream |
+| `make stb-stop STB_IP=...` | Stop streaming and app on STB |
+| `make stb-logs STB_IP=...` | Tail logcat from STB |
+| `make stb-screenshot STB_IP=...` | Capture STB screenshot |
+
+### Bash script — Emulator (`./run.sh`)
 
 ```bash
 ./run.sh                          # Full pipeline with test pattern
@@ -224,6 +239,21 @@ MulticastPlayer: [STATS] Playing | res=1280x720 fps=-1.0 vBitrate=n/a | audio=au
 ./run.sh screenshot               # Capture screenshot
 ./run.sh info                     # Show platform info
 ./run.sh --help                   # Show full usage
+```
+
+### Bash script — STB (`./run.sh -t <IP>`)
+
+```bash
+./run.sh stb-setup -t 192.168.1.100                  # First-time setup (interactive)
+./run.sh -t 192.168.1.100                              # Full pipeline: connect + install + stream
+./run.sh -t 192.168.1.100 -f streams/sample.ts         # Stream a file to STB
+./run.sh -t 192.168.1.100 --multicast 239.1.1.1        # Multicast mode
+./run.sh install -t 192.168.1.100                      # Install only
+./run.sh stream -t 192.168.1.100                       # Stream only
+./run.sh stream -t 192.168.1.100 -f streams/sample.ts  # Stream file only
+./run.sh logs -t 192.168.1.100                         # Watch player logs
+./run.sh stb-info -t 192.168.1.100                     # Device info
+./run.sh stop -t 192.168.1.100                         # Stop app on STB
 ```
 
 ## How It Works
@@ -318,27 +348,120 @@ GPU_MODE=swiftshader_indirect make emulator
 
 If you don't have Android Studio installed, `make setup` downloads the Android cmdline-tools and SDK components to `~/Android/Sdk`. No Android Studio installation required.
 
-## On Real STB Hardware
+## Google TV / STB Deployment
 
-On a real Set-Top Box connected to a multicast-capable LAN:
+The scripts have full support for deploying to real Google TV set-top boxes over your local network. No code changes needed — just pass `-t <IP>`.
 
-### 1. Change the stream URI
-
-```kotlin
-// In MainActivity.kt, change DEFAULT_STREAM_URI:
-private const val DEFAULT_STREAM_URI = "udp://239.1.1.1:5000"
-
-// Or pass via intent at runtime:
-adb shell am start -n com.cryptoguard.multicastplayer/.MainActivity \
-    --es STREAM_URI "udp://239.1.1.1:5000"
-```
-
-### 2. Multicast on the LAN
+### Quick start (STB)
 
 ```bash
-ffmpeg -re -i input.ts \
-    -c copy \
-    -f mpegts "udp://239.1.1.1:5000?pkt_size=1316&ttl=1"
+# 1. One-time setup: enable developer mode, connect ADB (interactive)
+./run.sh stb-setup -t 192.168.1.100
+
+# 2. Build, deploy, and stream — one command
+./run.sh -t 192.168.1.100 -f streams/sample_1280x720_surfing_with_audio.ts
+```
+
+Or with make:
+```bash
+make stb-setup STB_IP=192.168.1.100
+make stb-run   STB_IP=192.168.1.100
+```
+
+### Step-by-step STB setup
+
+#### 1. Enable Developer Options on your Google TV
+
+1. On your TV, go to **Settings → System → About**
+2. Scroll down to **"Android TV OS build"**
+3. Click it **7 times** — you'll see "You are now a developer!"
+
+#### 2. Enable ADB Debugging
+
+1. Go to **Settings → System → Developer options**
+2. Turn ON **"USB debugging"** (also called "ADB debugging")
+3. If available, also turn ON **"ADB over network"** / **"Wireless debugging"**
+
+> **Note:** Some Google TV devices show the IP address in Developer options under "ADB over network". Note this IP — you'll need it.
+
+#### 3. Find your STB's IP address
+
+Your STB's IP is usually shown in:
+- **Settings → Network & Internet → (your Wi-Fi network) → IP address**
+- **Settings → System → Developer options → ADB over network**
+
+Or scan your network:
+```bash
+# If you know your subnet
+nmap -sn 192.168.1.0/24
+
+# Or check your router's DHCP client list
+```
+
+#### 4. Connect and deploy
+
+```bash
+# Interactive setup (walks you through authorization)
+./run.sh stb-setup -t 192.168.1.100
+
+# After setup, deploy and stream:
+./run.sh -t 192.168.1.100 -f streams/sample_1280x720_surfing_with_audio.ts
+```
+
+When you first connect, **check your TV screen** — it will show an "Allow USB debugging?" dialog. Check "Always allow from this computer" and click "Allow".
+
+### STB streaming modes
+
+#### Unicast (default — simplest)
+
+Sends UDP packets directly from your laptop to the STB's IP:
+
+```bash
+./run.sh -t 192.168.1.100 -f streams/sample_1280x720_surfing_with_audio.ts
+```
+
+```
+Laptop ──► udp://192.168.1.100:5000 ──► STB
+```
+
+#### Multicast (for multi-STB or production testing)
+
+Sends to a multicast group that the STB joins:
+
+```bash
+./run.sh -t 192.168.1.100 --multicast 239.1.1.1 -f streams/sample_1280x720_surfing_with_audio.ts
+```
+
+```
+Laptop ──► udp://239.1.1.1:5000 ──► Switch ──► STB1, STB2, STB3...
+```
+
+> **Note:** Your network switch/router must support IGMP snooping for multicast to work. Most home routers do.
+
+### STB vs Emulator differences
+
+| Aspect | Emulator | STB |
+|--------|----------|-----|
+| Connection | Local process | ADB over WiFi/Ethernet |
+| UDP delivery | Emulator console redirect | Direct network (unicast or multicast) |
+| Video profile | H.264 Baseline (software decode) | H.264 High (hardware decode) |
+| Max resolution | 720p (practical) | 1080p / 4K (hardware dependent) |
+| Bitrate | 2-3 Mbps | 5+ Mbps |
+| Audio | Emulator audio passthrough | HDMI/Bluetooth audio |
+
+### Watching logs from STB
+
+```bash
+./run.sh logs -t 192.168.1.100
+# or
+make stb-logs STB_IP=192.168.1.100
+```
+
+### Taking a screenshot from STB
+
+```bash
+./run.sh screenshot -t 192.168.1.100
+# Saved to screenshot.png
 ```
 
 ## Streaming Your Own Content
@@ -404,6 +527,12 @@ ffmpeg -re -stream_loop -1 -i input.ts -c copy \
 | **`/dev/kvm` permission denied** | Run `sudo adduser $USER kvm` and log out/in |
 | **No display (headless Linux)** | Set `GPU_MODE=swiftshader_indirect` or run `make setup` which auto-detects headless |
 | **Android SDK not found** | Set `export ANDROID_HOME=/path/to/sdk` or run `make setup` to install |
+| **STB: "unable to connect"** | Ensure ADB debugging is ON in Developer options. Check the IP is correct. Try `adb connect <ip>:5555` manually |
+| **STB: "unauthorized"** | Check the TV screen for the "Allow USB debugging?" dialog. Click Allow |
+| **STB: connection drops** | Some STBs disconnect ADB after sleep. Wake the TV first, then reconnect: `./run.sh stb-connect -t <ip>` |
+| **STB: app won't install** | Check available storage: `adb -s <ip>:5555 shell df`. Some STBs have very limited internal storage |
+| **STB: no video on multicast** | Verify your router supports IGMP. Try unicast first (`-t <ip>` without `--multicast`). Check `make stb-logs` |
+| **STB: ADB port not 5555** | Some devices use a different port. Check Developer options or try: `./run.sh stb-setup -t <ip> -p <port>` |
 
 ## Tech Stack
 
