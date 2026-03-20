@@ -2,6 +2,8 @@
 
 A sample Android TV application that plays back MPEGTS video streams over UDP. Designed for Set-Top Box (STB) deployments where video is delivered via IP multicast.
 
+**Cross-platform:** works on macOS (Intel & Apple Silicon) and Linux (x86_64 & arm64).
+
 ## What It Does
 
 - Receives MPEGTS-over-UDP streams using AndroidX Media3 (ExoPlayer)
@@ -16,11 +18,29 @@ A sample Android TV application that plays back MPEGTS video streams over UDP. D
 
 ## Prerequisites
 
-- **macOS** (Apple Silicon or Intel)
-- **Homebrew** — [brew.sh](https://brew.sh)
-- **ffmpeg** — `brew install ffmpeg`
-- **Android SDK** — installed at `~/Library/Android/sdk` (default Android Studio location)
-- **JDK 17** — installed automatically by `make setup`
+| Requirement | macOS | Linux (Ubuntu/Debian) | Linux (Fedora) | Linux (Arch) |
+|-------------|-------|----------------------|----------------|--------------|
+| JDK 17 | `brew install openjdk@17` | `sudo apt install openjdk-17-jdk-headless` | `sudo dnf install java-17-openjdk-devel` | `sudo pacman -S jdk17-openjdk` |
+| ffmpeg | `brew install ffmpeg` | `sudo apt install ffmpeg` | `sudo dnf install ffmpeg` | `sudo pacman -S ffmpeg` |
+| Android SDK | Android Studio or `brew install --cask android-commandlinetools` | Downloaded automatically by `make setup` | Downloaded automatically | Downloaded automatically |
+| KVM (x86_64 only) | n/a | `sudo apt install qemu-kvm && sudo adduser $USER kvm` | `sudo dnf install qemu-kvm` | `sudo pacman -S qemu-base` |
+
+> **Note:** `make setup` / `./run.sh setup` installs all of the above automatically.
+
+### Platform-specific defaults
+
+| Setting | macOS | Linux |
+|---------|-------|-------|
+| `ANDROID_HOME` | `~/Library/Android/sdk` | `~/Android/Sdk` |
+| `JAVA_HOME` | Homebrew or `/usr/libexec/java_home` | `/usr/lib/jvm/java-17-openjdk-*` |
+| Emulator ABI | `arm64-v8a` (Apple Silicon) or `x86_64` (Intel) | `x86_64` or `arm64-v8a` |
+| GPU mode | `auto` | `auto` (with display) or `swiftshader_indirect` (headless) |
+
+All of these are auto-detected. Override with environment variables if needed:
+```bash
+export ANDROID_HOME=/custom/path/to/sdk
+export JAVA_HOME=/custom/path/to/jdk17
+```
 
 ## Quick Start
 
@@ -64,6 +84,25 @@ make stream
 
 # 6. (In another terminal) Watch player logs
 make logs
+```
+
+### Check your platform detection
+
+```bash
+make info
+# or
+./run.sh info
+```
+
+Output example:
+```
+Platform:       macos
+Architecture:   arm64
+Emulator ABI:   arm64-v8a
+System image:   system-images;android-34;android-tv;arm64-v8a
+GPU mode:       auto
+JAVA_HOME:      /opt/homebrew/Cellar/openjdk@17/17.0.18/libexec/openjdk.jdk/Contents/Home
+ANDROID_HOME:   /Users/you/Library/Android/sdk
 ```
 
 ## Streaming Video Files
@@ -155,6 +194,7 @@ MulticastPlayer: [STATS] Playing | res=1280x720 fps=-1.0 vBitrate=n/a | audio=au
 | Command           | Description                                       |
 |-------------------|---------------------------------------------------|
 | `make help`       | Show all available commands                       |
+| `make info`       | Show detected platform and tool paths             |
 | `make setup`      | Install JDK 17, Android TV image, create AVD      |
 | `make build`      | Build the debug APK                                |
 | `make emulator`   | Launch Android TV emulator                         |
@@ -182,6 +222,7 @@ MulticastPlayer: [STATS] Playing | res=1280x720 fps=-1.0 vBitrate=n/a | audio=au
 ./run.sh stop                     # Stop everything
 ./run.sh logs                     # Tail logcat
 ./run.sh screenshot               # Capture screenshot
+./run.sh info                     # Show platform info
 ./run.sh --help                   # Show full usage
 ```
 
@@ -191,7 +232,7 @@ MulticastPlayer: [STATS] Playing | res=1280x720 fps=-1.0 vBitrate=n/a | audio=au
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  Host (macOS)                                           │
+│  Host (macOS or Linux)                                  │
 │                                                         │
 │  ffmpeg ──► udp://127.0.0.1:5000 ──► emulator console  │
 │  (test pattern or .ts file          UDP redirect        │
@@ -246,6 +287,37 @@ The app is designed to keep playing:
 - **Auto-restart on STATE_ENDED** — seeks back to default position and re-prepares
 - **Buffering overlay** — shows a spinner with status message during buffering, errors, or reconnection
 
+## Linux-Specific Notes
+
+### KVM acceleration (x86_64 only)
+
+On x86_64 Linux, the Android emulator requires KVM for acceptable performance:
+
+```bash
+# Ubuntu/Debian
+sudo apt install qemu-kvm
+sudo adduser $USER kvm
+# Log out and back in for group membership to take effect
+
+# Verify KVM is working
+ls -la /dev/kvm
+```
+
+On ARM64 Linux, KVM is used automatically if available. Without KVM, the emulator runs in software emulation mode (very slow).
+
+### Headless / CI environments
+
+The emulator can run without a display using `swiftshader_indirect` GPU mode. This is auto-detected when `$DISPLAY` and `$WAYLAND_DISPLAY` are unset:
+
+```bash
+# Force headless mode
+GPU_MODE=swiftshader_indirect make emulator
+```
+
+### Android SDK on Linux
+
+If you don't have Android Studio installed, `make setup` downloads the Android cmdline-tools and SDK components to `~/Android/Sdk`. No Android Studio installation required.
+
 ## On Real STB Hardware
 
 On a real Set-Top Box connected to a multicast-capable LAN:
@@ -292,8 +364,8 @@ ffmpeg -re -stream_loop -1 -i input.ts -c copy \
 ## Project Structure
 
 ```
-├── Makefile                          # Build/run automation (test pattern)
-├── run.sh                            # Bash script with -f FILE support
+├── Makefile                          # Build/run automation (cross-platform)
+├── run.sh                            # Bash script with -f FILE support (cross-platform)
 ├── ffmpeg_filter.txt                 # Drawtext filter for test pattern overlay
 ├── README.md                         # This file
 ├── build.gradle.kts                  # Root Gradle config
@@ -318,8 +390,9 @@ ffmpeg -re -stream_loop -1 -i input.ts -c copy \
 
 | Problem | Solution |
 |---------|----------|
-| **Build fails: "25.0.2" error** | JDK 25 is being used instead of 17. Run `export JAVA_HOME=$(brew --prefix openjdk@17)/libexec/openjdk.jdk/Contents/Home` before building |
+| **Build fails: JDK version error** | Wrong JDK is being used. Run `./run.sh info` to check. Set `export JAVA_HOME=/path/to/jdk17` |
 | **Emulator won't boot** | Run `make setup` to install the Android TV system image. Verify with `emulator -list-avds` |
+| **Emulator extremely slow (Linux)** | KVM is not enabled. Run `sudo apt install qemu-kvm && sudo adduser $USER kvm`, then log out/in |
 | **App shows buffering forever** | Make sure `make stream` or `./run.sh stream -f ...` is running. Check `make logs` for errors |
 | **Video is garbled/artifacts** | The baseline profile + closed GOPs settings should fix this. If still garbled, reduce the video bitrate in `run.sh` |
 | **Stream stops after a few seconds** | The app auto-retries. Check `make logs` — look for `[STATS]` lines to confirm it's playing. File streams loop infinitely |
@@ -328,6 +401,9 @@ ffmpeg -re -stream_loop -1 -i input.ts -c copy \
 | **UDP redirect fails** | The emulator console must be on `localhost:5554`. Check with `nc localhost 5554` |
 | **No audio** | If the source file has no audio, `run.sh` auto-generates a silent track. Check `make logs` for `AUDIO TRACK` |
 | **File not found** | Paths are relative to the project root. Use `./run.sh -f streams/filename.ts` |
+| **`/dev/kvm` permission denied** | Run `sudo adduser $USER kvm` and log out/in |
+| **No display (headless Linux)** | Set `GPU_MODE=swiftshader_indirect` or run `make setup` which auto-detects headless |
+| **Android SDK not found** | Set `export ANDROID_HOME=/path/to/sdk` or run `make setup` to install |
 
 ## Tech Stack
 

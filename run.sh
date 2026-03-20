@@ -2,6 +2,8 @@
 #
 # run.sh - Build, deploy, and stream to the Android TV Multicast Player
 #
+# Cross-platform: macOS (Intel/Apple Silicon) and Linux (x86_64/arm64)
+#
 # Usage:
 #   ./run.sh                                          Run with test pattern
 #   ./run.sh -f streams/sample_1280x720_surfing_with_audio.ts
@@ -18,9 +20,82 @@
 #
 set -euo pipefail
 
+# --- Platform detection ---
+detect_platform() {
+    OS="$(uname -s)"
+    ARCH="$(uname -m)"
+
+    case "$OS" in
+        Darwin) PLATFORM="macos" ;;
+        Linux)  PLATFORM="linux" ;;
+        MINGW*|MSYS*|CYGWIN*)
+            error "Windows is not directly supported. Use WSL2 (Windows Subsystem for Linux) instead."
+            ;;
+        *)      error "Unsupported OS: $OS" ;;
+    esac
+
+    case "$ARCH" in
+        x86_64|amd64)  EMU_ABI="x86_64" ;;
+        arm64|aarch64) EMU_ABI="arm64-v8a" ;;
+        *)             error "Unsupported architecture: $ARCH" ;;
+    esac
+}
+
+# Resolve ANDROID_HOME per platform
+detect_android_home() {
+    if [[ -n "${ANDROID_HOME:-}" ]]; then
+        return
+    fi
+    case "$PLATFORM" in
+        macos) ANDROID_HOME="$HOME/Library/Android/sdk" ;;
+        linux) ANDROID_HOME="$HOME/Android/Sdk" ;;
+    esac
+}
+
+# Resolve JAVA_HOME per platform
+detect_java_home() {
+    if [[ -n "${JAVA_HOME:-}" && -x "${JAVA_HOME}/bin/java" ]]; then
+        return
+    fi
+    case "$PLATFORM" in
+        macos)
+            # Try Homebrew first, then /usr/libexec/java_home
+            if command -v brew >/dev/null 2>&1; then
+                local brew_prefix
+                brew_prefix="$(brew --prefix openjdk@17 2>/dev/null || true)"
+                if [[ -n "$brew_prefix" && -d "$brew_prefix" ]]; then
+                    JAVA_HOME="$brew_prefix/libexec/openjdk.jdk/Contents/Home"
+                    return
+                fi
+            fi
+            if /usr/libexec/java_home -v 17 >/dev/null 2>&1; then
+                JAVA_HOME="$(/usr/libexec/java_home -v 17)"
+                return
+            fi
+            ;;
+        linux)
+            # Try common JDK 17 locations
+            for jdir in \
+                /usr/lib/jvm/java-17-openjdk-amd64 \
+                /usr/lib/jvm/java-17-openjdk-arm64 \
+                /usr/lib/jvm/java-17-openjdk \
+                /usr/lib/jvm/java-17 \
+                /usr/lib/jvm/temurin-17-jdk-* \
+                /usr/lib/jvm/adoptopenjdk-17-*; do
+                if [[ -x "$jdir/bin/java" ]]; then
+                    JAVA_HOME="$jdir"
+                    return
+                fi
+            done
+            ;;
+    esac
+    JAVA_HOME=""
+}
+
 # --- Configuration ---
-ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
-JAVA_HOME="${JAVA_HOME:-$(brew --prefix openjdk@17 2>/dev/null)/libexec/openjdk.jdk/Contents/Home}"
+detect_platform
+detect_android_home
+detect_java_home
 export ANDROID_HOME JAVA_HOME
 
 AVD_NAME="TV_API_34"
@@ -43,17 +118,26 @@ AVDMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# System image to use (architecture-dependent)
+SYSTEM_IMAGE="system-images;android-34;android-tv;${EMU_ABI}"
+
+# GPU mode: macOS can use 'auto', Linux headless may need swiftshader
+if [[ "$PLATFORM" == "linux" && -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+    GPU_MODE="swiftshader_indirect"
+else
+    GPU_MODE="auto"
+fi
+
 # --- Helpers ---
 info()  { echo -e "\033[36m==>\033[0m $*"; }
 warn()  { echo -e "\033[33mWARN:\033[0m $*"; }
 error() { echo -e "\033[31mERROR:\033[0m $*" >&2; exit 1; }
 
 check_env() {
-    command -v brew >/dev/null 2>&1    || error "Homebrew not found"
     [[ -x "$JAVA_HOME/bin/java" ]]     || error "JDK 17 not found. Run: ./run.sh setup"
     [[ -x "$ADB" ]]                    || error "Android SDK not found at $ANDROID_HOME"
     [[ -x "$EMULATOR_BIN" ]]           || error "Android emulator not found"
-    command -v ffmpeg >/dev/null 2>&1   || error "ffmpeg not found. Install with: brew install ffmpeg"
+    command -v ffmpeg >/dev/null 2>&1   || error "ffmpeg not found. Install with: ${PLATFORM_PKG_HINT:-your package manager}"
 }
 
 # Parse -f FILE from remaining args (after command is consumed)
@@ -80,35 +164,130 @@ parse_file_arg() {
     fi
 }
 
+# --- Package manager helpers ---
+pkg_install() {
+    case "$PLATFORM" in
+        macos)
+            command -v brew >/dev/null 2>&1 || error "Homebrew not found. Install from https://brew.sh"
+            brew install "$@" || true
+            ;;
+        linux)
+            if command -v apt-get >/dev/null 2>&1; then
+                sudo apt-get update && sudo apt-get install -y "$@"
+            elif command -v dnf >/dev/null 2>&1; then
+                sudo dnf install -y "$@"
+            elif command -v pacman >/dev/null 2>&1; then
+                sudo pacman -Sy --noconfirm "$@"
+            else
+                error "No supported package manager found (apt, dnf, pacman)"
+            fi
+            ;;
+    esac
+}
+
 # --- Commands ---
 do_setup() {
-    info "Installing JDK 17..."
-    brew install openjdk@17 || true
+    info "Platform: $PLATFORM ($ARCH)"
+    info "Emulator ABI: $EMU_ABI"
+    info "System image: $SYSTEM_IMAGE"
+    echo ""
 
-    info "Installing Android cmdline-tools..."
-    if [[ ! -x "$SDKMANAGER" ]]; then
-        brew install --cask android-commandlinetools || true
-        sdkmanager --sdk_root="$ANDROID_HOME" --install "cmdline-tools;latest"
+    # --- JDK 17 ---
+    info "Installing JDK 17..."
+    case "$PLATFORM" in
+        macos)
+            command -v brew >/dev/null 2>&1 || error "Homebrew not found. Install from https://brew.sh"
+            brew install openjdk@17 || true
+            ;;
+        linux)
+            if command -v apt-get >/dev/null 2>&1; then
+                sudo apt-get update && sudo apt-get install -y openjdk-17-jdk-headless
+            elif command -v dnf >/dev/null 2>&1; then
+                sudo dnf install -y java-17-openjdk-devel
+            elif command -v pacman >/dev/null 2>&1; then
+                sudo pacman -Sy --noconfirm jdk17-openjdk
+            else
+                error "Install JDK 17 manually and set JAVA_HOME"
+            fi
+            ;;
+    esac
+    # Re-detect after install
+    detect_java_home
+    export JAVA_HOME
+    info "JAVA_HOME=$JAVA_HOME"
+
+    # --- ffmpeg ---
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        info "Installing ffmpeg..."
+        case "$PLATFORM" in
+            macos) brew install ffmpeg ;;
+            linux) pkg_install ffmpeg ;;
+        esac
     fi
 
-    info "Installing Android TV system image and platform..."
+    # --- Android SDK cmdline-tools ---
+    info "Installing Android cmdline-tools..."
+    if [[ ! -x "$SDKMANAGER" ]]; then
+        case "$PLATFORM" in
+            macos)
+                brew install --cask android-commandlinetools || true
+                sdkmanager --sdk_root="$ANDROID_HOME" --install "cmdline-tools;latest"
+                ;;
+            linux)
+                # Download cmdline-tools if not present
+                mkdir -p "$ANDROID_HOME"
+                local cmdtools_zip="/tmp/commandlinetools.zip"
+                local cmdtools_url="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+                info "Downloading Android cmdline-tools..."
+                curl -fSL -o "$cmdtools_zip" "$cmdtools_url"
+                unzip -qo "$cmdtools_zip" -d "$ANDROID_HOME/cmdline-tools-tmp"
+                mkdir -p "$ANDROID_HOME/cmdline-tools"
+                mv "$ANDROID_HOME/cmdline-tools-tmp/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+                rm -rf "$ANDROID_HOME/cmdline-tools-tmp" "$cmdtools_zip"
+                ;;
+        esac
+    fi
+    # Re-resolve after install
+    SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+    AVDMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager"
+
+    # --- KVM check (Linux only) ---
+    if [[ "$PLATFORM" == "linux" && "$EMU_ABI" == "x86_64" ]]; then
+        if [[ ! -w /dev/kvm ]]; then
+            warn "/dev/kvm is not writable. The emulator will be very slow without KVM."
+            warn "Fix with: sudo apt install qemu-kvm && sudo adduser \$USER kvm"
+        fi
+    fi
+
+    # --- Android TV system image ---
+    info "Installing Android TV system image ($SYSTEM_IMAGE)..."
     yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" \
-        "system-images;android-34;android-tv;arm64-v8a" \
+        "$SYSTEM_IMAGE" \
         "platforms;android-34" \
+        "platform-tools" \
+        "emulator" \
         "build-tools;36.0.0"
 
+    # --- Create AVD ---
     info "Creating Android TV AVD..."
+    AVDMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager"
     if ! "$AVDMANAGER" list avd 2>/dev/null | grep -q "$AVD_NAME"; then
         echo "no" | "$AVDMANAGER" create avd \
             -n "$AVD_NAME" \
-            -k "system-images;android-34;android-tv;arm64-v8a" \
+            -k "$SYSTEM_IMAGE" \
             -d "tv_1080p"
     else
         info "AVD '$AVD_NAME' already exists."
     fi
 
     echo "sdk.dir=$ANDROID_HOME" > local.properties
+    echo ""
     info "Setup complete!"
+    info "  Platform:     $PLATFORM ($ARCH)"
+    info "  JAVA_HOME:    $JAVA_HOME"
+    info "  ANDROID_HOME: $ANDROID_HOME"
+    info "  System image: $SYSTEM_IMAGE"
+    info "  AVD:          $AVD_NAME"
 }
 
 do_build() {
@@ -125,8 +304,8 @@ do_emulator() {
         return
     fi
 
-    info "Launching Android TV emulator..."
-    "$EMULATOR_BIN" -avd "$AVD_NAME" -no-snapshot-load -gpu auto &>/dev/null &
+    info "Launching Android TV emulator (gpu=$GPU_MODE)..."
+    "$EMULATOR_BIN" -avd "$AVD_NAME" -no-snapshot-load -gpu "$GPU_MODE" &>/dev/null &
 
     info "Waiting for emulator to boot..."
     "$ADB" -s "$EMULATOR_SERIAL" wait-for-device
@@ -152,8 +331,16 @@ do_redirect() {
     info "Setting up UDP redirect (host:$UDP_PORT -> guest:$UDP_PORT)..."
     local auth_token
     auth_token=$(cat ~/.emulator_console_auth_token 2>/dev/null || echo "")
-    (echo "auth $auth_token"; sleep 0.3; echo "redir add udp:$UDP_PORT:$UDP_PORT"; sleep 0.3; echo "quit") \
-        | nc localhost 5554 >/dev/null 2>&1 || true
+
+    # Use printf+nc for cross-platform compatibility (BSD nc vs GNU nc)
+    {
+        printf "auth %s\r\n" "$auth_token"
+        sleep 0.3
+        printf "redir add udp:%s:%s\r\n" "$UDP_PORT" "$UDP_PORT"
+        sleep 0.3
+        printf "quit\r\n"
+    } | nc localhost 5554 >/dev/null 2>&1 || true
+
     info "UDP redirect active."
 }
 
@@ -216,9 +403,6 @@ do_stream_file() {
     fi
 
     # Build ffmpeg command
-    # - Always re-encode to H.264/AAC for maximum compatibility
-    # - Loop infinitely with -stream_loop -1
-    # - If no audio in source, generate silent audio track
     local ffmpeg_cmd=(
         ffmpeg -re
         -stream_loop -1
@@ -301,8 +485,22 @@ do_run() {
     do_stream
 }
 
+do_info() {
+    info "Platform:       $PLATFORM ($ARCH)"
+    info "Emulator ABI:   $EMU_ABI"
+    info "System image:   $SYSTEM_IMAGE"
+    info "GPU mode:       $GPU_MODE"
+    info "JAVA_HOME:      ${JAVA_HOME:-<not set>}"
+    info "ANDROID_HOME:   $ANDROID_HOME"
+    info "SDK Manager:    $SDKMANAGER"
+    info "ADB:            $ADB"
+    info "Emulator:       $EMULATOR_BIN"
+    info "ffmpeg:         $(command -v ffmpeg 2>/dev/null || echo '<not found>')"
+    info "python3:        $(command -v python3 2>/dev/null || echo '<not found>')"
+}
+
 show_usage() {
-    cat <<'USAGE'
+    cat <<USAGE
 Usage: ./run.sh [command] [-f FILE]
 
 Commands:
@@ -315,17 +513,21 @@ Commands:
   stop         Stop emulator and ffmpeg
   logs         Tail logcat for player events
   screenshot   Capture emulator screenshot
+  info         Show detected platform and tool paths
 
 Options:
   -f, --file FILE    Stream a .ts file instead of the test pattern
                      The file is re-encoded to H.264/AAC and looped infinitely.
                      4K files are automatically scaled down for the emulator.
 
+Platform: $PLATFORM ($ARCH), ABI: $EMU_ABI
+
 Examples:
   ./run.sh                                                    # Test pattern
   ./run.sh -f streams/sample_1280x720_surfing_with_audio.ts   # Surfing video
   ./run.sh -f streams/sample_3840x2160.ts                     # 4K (auto-scaled)
   ./run.sh stream -f streams/sample_1280x720_surfing_with_audio.ts  # Stream only
+  ./run.sh info                                               # Show platform info
 USAGE
 }
 
@@ -337,7 +539,7 @@ EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        setup|build|emulator|install|stream|run|stop|logs|screenshot)
+        setup|build|emulator|install|stream|run|stop|logs|screenshot|info)
             if [[ -z "$COMMAND" ]]; then
                 COMMAND="$1"
                 shift
@@ -377,5 +579,6 @@ case "$COMMAND" in
     stop)       do_stop ;;
     logs)       do_logs ;;
     screenshot) do_screenshot ;;
+    info)       do_info ;;
     *)          show_usage; exit 1 ;;
 esac
